@@ -3,6 +3,18 @@ import { WebSocketServer } from "ws";
 const port = Number(process.env.PORT || 8080);
 const rooms = new Map();
 
+function normalizeDisplayName(raw) {
+  return String(raw || "")
+    .replace(/[\s\u00A0]+/g, " ")
+    .trim()
+    .slice(0, 32);
+}
+
+function fallbackDisplayName(userId) {
+  const suffix = String(userId || "user").slice(-4);
+  return `User-${suffix}`;
+}
+
 function send(ws, payload) {
   if (!ws || ws.readyState !== 1) {
     return;
@@ -20,7 +32,8 @@ function getRoom(roomId) {
     rooms.set(roomId, {
       leaderId: null,
       leaderEpoch: 0,
-      clients: new Map()
+      clients: new Map(),
+      displayNames: new Map()
     });
   }
 
@@ -30,6 +43,10 @@ function getRoom(roomId) {
 function chooseLeader(room) {
   const ids = [...room.clients.keys()].sort();
   return ids.length > 0 ? ids[0] : null;
+}
+
+function peerNamesObject(room) {
+  return Object.fromEntries(room.displayNames.entries());
 }
 
 function broadcast(room, payload, exceptUserId = null) {
@@ -54,12 +71,17 @@ function leaveRoom(ws) {
   }
 
   const { roomId, userId } = meta;
-
-  if (room.clients.get(userId) === ws) {
-    room.clients.delete(userId);
+  const isCurrentConnection = room.clients.get(userId) === ws;
+  if (!isCurrentConnection) {
+    ws.meta = { roomId: null, userId: null };
+    return;
   }
 
-  broadcast(room, { type: "peer-left", peerId: userId }, userId);
+  const displayName = room.displayNames.get(userId) || fallbackDisplayName(userId);
+
+  room.clients.delete(userId);
+  room.displayNames.delete(userId);
+  broadcast(room, { type: "peer-left", peerId: userId, displayName }, userId);
 
   const wasLeader = room.leaderId === userId;
 
@@ -74,9 +96,39 @@ function leaveRoom(ws) {
   ws.meta = { roomId: null, userId: null };
 }
 
-function joinRoom(ws, roomId, userId) {
+function sendJoined(ws, room, roomId, userId, displayName) {
+  const peers = [...room.clients.keys()].filter((id) => id !== userId);
+
+  send(ws, {
+    type: "joined",
+    roomId,
+    peers,
+    peerNames: peerNamesObject(room),
+    displayName,
+    leaderId: room.leaderId,
+    leaderEpoch: room.leaderEpoch
+  });
+}
+
+function joinRoom(ws, roomId, userId, requestedDisplayName) {
   if (!roomId || !userId) {
     send(ws, { type: "error", message: "roomId and userId are required" });
+    return;
+  }
+
+  const displayName = normalizeDisplayName(requestedDisplayName) || fallbackDisplayName(userId);
+
+  if (ws.meta.roomId === roomId && ws.meta.userId === userId) {
+    const room = getRoom(roomId);
+    room.clients.set(userId, ws);
+    room.displayNames.set(userId, displayName);
+
+    if (!room.leaderId || !room.clients.has(room.leaderId)) {
+      room.leaderId = chooseLeader(room) || userId;
+      room.leaderEpoch += 1;
+    }
+
+    sendJoined(ws, room, roomId, userId, displayName);
     return;
   }
 
@@ -86,13 +138,20 @@ function joinRoom(ws, roomId, userId) {
 
   const room = getRoom(roomId);
 
-  if (room.clients.has(userId) && room.clients.get(userId) !== ws) {
-    send(ws, { type: "error", message: "duplicate userId in room" });
-    return;
+  const existingWs = room.clients.get(userId);
+  if (existingWs && existingWs !== ws) {
+    existingWs.meta = { roomId: null, userId: null };
+    try {
+      existingWs.close(4001, "session-replaced");
+    } catch (error) {
+      // no-op
+    }
+    room.clients.delete(userId);
+    room.displayNames.delete(userId);
   }
 
-  const peers = [...room.clients.keys()];
   room.clients.set(userId, ws);
+  room.displayNames.set(userId, displayName);
 
   if (!room.leaderId || !room.clients.has(room.leaderId)) {
     room.leaderId = userId;
@@ -101,15 +160,8 @@ function joinRoom(ws, roomId, userId) {
 
   ws.meta = { roomId, userId };
 
-  send(ws, {
-    type: "joined",
-    roomId,
-    peers,
-    leaderId: room.leaderId,
-    leaderEpoch: room.leaderEpoch
-  });
-
-  broadcast(room, { type: "peer-joined", peerId: userId }, userId);
+  sendJoined(ws, room, roomId, userId, displayName);
+  broadcast(room, { type: "peer-joined", peerId: userId, displayName }, userId);
 }
 
 function relaySignal(ws, to, payload) {
@@ -155,6 +207,7 @@ wss.on("connection", (ws) => {
 
   ws.on("message", (raw) => {
     let message;
+    ws.isAlive = true;
 
     try {
       message = JSON.parse(raw.toString());
@@ -169,7 +222,12 @@ wss.on("connection", (ws) => {
     }
 
     if (message.type === "join") {
-      joinRoom(ws, String(message.roomId || "").trim().toUpperCase(), String(message.userId || "").trim());
+      joinRoom(
+        ws,
+        String(message.roomId || "").trim().toUpperCase(),
+        String(message.userId || "").trim(),
+        String(message.displayName || "")
+      );
       return;
     }
 
@@ -180,6 +238,15 @@ wss.on("connection", (ws) => {
 
     if (message.type === "leave") {
       leaveRoom(ws);
+      return;
+    }
+
+    if (message.type === "ping") {
+      send(ws, { type: "pong", timestamp: Number.isFinite(message.timestamp) ? message.timestamp : Date.now() });
+      return;
+    }
+
+    if (message.type === "pong") {
       return;
     }
 
